@@ -248,6 +248,54 @@ CREATE TABLE users(
 			},
 		},
 		{
+			name: "table fk null and string ref column",
+			before: func(m mock) {
+				m.tableExists("users", true, "CREATE TABLE users(id INTEGER PRIMARY KEY, c1 int REFERENCES users, c2 int REFERENCES users(id))")
+				m.ExpectQuery(sqltest.Escape(fmt.Sprintf(columnsQuery, "users"))).
+					WillReturnRows(sqltest.Rows(`
+ name |   type   | nullable | dflt_value | primary | hidden
+------+----------+----------+------------+---------+--------
+ id   | integer  |  0       |            |  1      |  0
+ c1   | int      |  1       |            |  0      |  0
+ c2   | int      |  1       |            |  0      |  0
+`))
+				m.noIndexes("users")
+				// NULL to-column (shorthand REFERENCES users) and string to-column (REFERENCES users(id)).
+				rows := sqlmock.NewRows([]string{"id", "from", "to", "table", "on_update", "on_delete"})
+				rows.AddRow(0, "c1", nil, "users", "NO ACTION", "NO ACTION")
+				rows.AddRow(1, "c2", "id", "users", "NO ACTION", "NO ACTION")
+				m.ExpectQuery(sqltest.Escape(fmt.Sprintf(fksQuery, "users"))).
+					WillReturnRows(rows)
+				// PK lookup triggered by the NULL to-column.
+				m.ExpectQuery(sqltest.Escape("SELECT name FROM pragma_table_info('users') WHERE pk > 0 ORDER BY pk")).
+					WillReturnRows(sqltest.Rows(`
+ name
+------
+ id
+`))
+			},
+			expect: func(require *require.Assertions, t *schema.Table, err error) {
+				require.NoError(err)
+				columns := []*schema.Column{
+					{Name: "id", Type: &schema.ColumnType{Type: &schema.IntegerType{T: "integer"}, Raw: "integer"}},
+					{Name: "c1", Type: &schema.ColumnType{Null: true, Type: &schema.IntegerType{T: "int"}, Raw: "int"}},
+					{Name: "c2", Type: &schema.ColumnType{Null: true, Type: &schema.IntegerType{T: "int"}, Raw: "int"}},
+				}
+				fks := []*schema.ForeignKey{
+					{Symbol: "0", Table: t, RefTable: t, OnDelete: schema.NoAction, OnUpdate: schema.NoAction},
+					{Symbol: "1", Table: t, RefTable: t, OnDelete: schema.NoAction, OnUpdate: schema.NoAction},
+				}
+				columns[1].ForeignKeys = fks[:1]
+				columns[2].ForeignKeys = fks[1:]
+				fks[0].Columns = columns[1:2]
+				fks[0].RefColumns = columns[:1]
+				fks[1].Columns = columns[2:3]
+				fks[1].RefColumns = columns[:1]
+				require.Equal(t.Columns, columns)
+				require.Equal(t.ForeignKeys, fks)
+			},
+		},
+		{
 			name: "table options",
 			before: func(m mock) {
 				m.ExpectQuery(sqltest.Escape(fmt.Sprintf(databasesQueryArgs, "?"))).

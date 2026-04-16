@@ -227,40 +227,64 @@ func (i *inspect) fks(ctx context.Context, t *schema.Table) error {
 	if err != nil {
 		return fmt.Errorf("sqlite: querying %q foreign-keys: %w", t.Name, err)
 	}
-	if err := i.addFKs(t, rows); err != nil {
+	if err := i.addFKs(ctx, t, rows); err != nil {
 		return fmt.Errorf("sqlite: scan %q foreign-keys: %w", t.Name, err)
 	}
 	return fillConstName(t)
 }
 
-func (i *inspect) addFKs(t *schema.Table, rows *sql.Rows) error {
-	ids := make(map[int]*schema.ForeignKey)
+func (i *inspect) addFKs(ctx context.Context, t *schema.Table, rows *sql.Rows) error {
+	type fkRow struct {
+		id                                       int
+		column, refTable, updateRule, deleteRule string
+		refColumn                                sql.NullString
+	}
+	var buf []fkRow
 	for rows.Next() {
-		var (
-			id                                                  int
-			column, refColumn, refTable, updateRule, deleteRule string
-		)
-		if err := rows.Scan(&id, &column, &refColumn, &refTable, &updateRule, &deleteRule); err != nil {
+		var r fkRow
+		// SQLite returns NULL for `to` when a FK is declared with the
+		// shorthand "REFERENCES tbl" syntax (no explicit column), so scan
+		// into sql.NullString.
+		if err := rows.Scan(&r.id, &r.column, &r.refColumn, &r.refTable, &r.updateRule, &r.deleteRule); err != nil {
 			return err
 		}
-		fk, ok := ids[id]
+		buf = append(buf, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	ids := make(map[int]*schema.ForeignKey)
+	for _, r := range buf {
+		// Resolve NULL ref-column to the referenced table's primary key.
+		refColName := r.refColumn.String
+		if !r.refColumn.Valid {
+			pk, err := i.refTablePK(ctx, r.refTable)
+			if err != nil {
+				return fmt.Errorf("resolving shorthand FK on %q: %w", r.refTable, err)
+			}
+			refColName = pk
+		}
+		fk, ok := ids[r.id]
 		if !ok {
 			fk = &schema.ForeignKey{
-				Symbol:   strconv.Itoa(id),
+				Symbol:   strconv.Itoa(r.id),
 				Table:    t,
 				RefTable: t,
-				OnDelete: schema.ReferenceOption(deleteRule),
-				OnUpdate: schema.ReferenceOption(updateRule),
+				OnDelete: schema.ReferenceOption(r.deleteRule),
+				OnUpdate: schema.ReferenceOption(r.updateRule),
 			}
-			if refTable != t.Name {
-				fk.RefTable = &schema.Table{Name: refTable, Schema: &schema.Schema{Name: t.Schema.Name}}
+			if r.refTable != t.Name {
+				fk.RefTable = &schema.Table{Name: r.refTable, Schema: &schema.Schema{Name: t.Schema.Name}}
 			}
-			ids[id] = fk
+			ids[r.id] = fk
 			t.ForeignKeys = append(t.ForeignKeys, fk)
 		}
-		c, ok := t.Column(column)
+		c, ok := t.Column(r.column)
 		if !ok {
-			return fmt.Errorf("column %q was not found for fk %q", column, fk.Symbol)
+			return fmt.Errorf("column %q was not found for fk %q", r.column, fk.Symbol)
 		}
 		// Rows are ordered by SEQ that specifies the
 		// position of the column in the FK definition.
@@ -272,17 +296,36 @@ func (i *inspect) addFKs(t *schema.Table, rows *sql.Rows) error {
 		// Stub referenced columns or link if it is a self-reference.
 		var rc *schema.Column
 		if fk.Table != fk.RefTable {
-			rc = &schema.Column{Name: refColumn}
-		} else if c, ok := t.Column(refColumn); ok {
+			rc = &schema.Column{Name: refColName}
+		} else if c, ok := t.Column(refColName); ok {
 			rc = c
 		} else {
-			return fmt.Errorf("referenced column %q was not found for fk %q", refColumn, fk.Symbol)
+			return fmt.Errorf("referenced column %q was not found for fk %q", refColName, fk.Symbol)
 		}
 		if _, ok := fk.RefColumn(rc.Name); !ok {
 			fk.RefColumns = append(fk.RefColumns, rc)
 		}
 	}
 	return nil
+}
+
+// refTablePK returns the primary-key column name of the given table. Used to
+// resolve shorthand foreign-key references (REFERENCES tbl) where SQLite
+// reports the target column as NULL in pragma_foreign_key_list.
+func (i *inspect) refTablePK(ctx context.Context, table string) (string, error) {
+	rows, err := i.QueryContext(ctx, fmt.Sprintf("SELECT name FROM pragma_table_info('%s') WHERE pk > 0 ORDER BY pk", table))
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return "", fmt.Errorf("no primary key found for referenced table %q", table)
+	}
+	var name string
+	if err := rows.Scan(&name); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 // tableNames returns a list of all tables exist in the schema.
